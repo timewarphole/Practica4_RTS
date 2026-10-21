@@ -1,0 +1,331 @@
+/**
+ * AircraftController.lf  -  Práctica 4, Sistemas de Tiempo Real 2026-2
+ * Controlador longitudinal de velocidad de una aeronave simulada (target C).
+ *
+ * ============================== MODELO (didáctico) ==============================
+ *   v_med[k] = v[k] + d_v[k]                         (medición con perturbación)
+ *   e_v[k]   = v_ref[k] - v_med[k]                   (error)
+ *   u_T[k]   = sat(Kp * e_v[k], 0, 1)                (comando de empuje normalizado)
+ *   v[k+1]   = v[k] + Ts*(a_T*u_T[k] - a_D*v[k])     (planta de 1er orden)
+ *
+ * ============================== PARÁMETROS Y JUSTIFICACIÓN ======================
+ *   Ts  = 0.010 s   Se obtiene del período del timer de la planta (10 ms).
+ *   a_T = 3.0  m/s^2 por unidad de empuje (aceleración con u_T = 1).
+ *   a_D = 0.02 1/s   Resistencia lineal simplificada.
+ *   => Velocidad máxima en régimen permanente (u_T = 1): a_T/a_D = 150 m/s.
+ *      Las referencias de 100 y 110 m/s son alcanzables sin saturación
+ *      permanente (u_T necesario: 0.67 y 0.73).
+ *   Estabilidad numérica: Ts*a_D = 2e-4 << 1, y el lazo cerrado discreto tiene
+ *      polo en 1 - Ts*(a_D + a_T*Kp) = 0.997 para Kp = 0.1 (estable, |polo| < 1).
+ *   Kp  = 0.1  [1/(m/s)]  El comando solo satura si |e_v| > 1/Kp = 10 m/s.
+ *      Un P puro deja error permanente: e_ss = vref*a_D/(a_D + a_T*Kp)
+ *      = 6.25 m/s para vref = 100 y 6.9 m/s para vref = 110 (esperado; se
+ *      documenta en el informe).
+ *   v0  = 90 m/s    Velocidad inicial (crucero cercano a la referencia).
+ *
+ * ============================== TIMERS (offset, período) ========================
+ *   SpeedReference    timer(0, 100 ms)   10 Hz
+ *   AirDataSensor     timer(0,   5 ms)  200 Hz
+ *   SpeedController   timer(0,  10 ms)  100 Hz
+ *   AircraftDynamics  timer(0,  10 ms)  100 Hz
+ *   FlightMonitor     timer(0, 100 ms)   10 Hz
+ *   Todos tienen offset 0: en t = 0 ms todos se activan en la misma tag y el
+ *   orden lo fija la causalidad de las conexiones, no la prioridad.
+ *
+ * ============================== TRATAMIENTO MULTI-RATE ==========================
+ *   Los periodos 5/10/100 ms son múltiplos entre sí, así que sus timers coinciden
+ *   en tags comunes (cada 10 ms coinciden sensor, controlador y planta; cada
+ *   100 ms coinciden los cinco). El valor de un puerto solo existe en la tag en
+ *   que se publica:
+ *     - El sensor publica a 200 Hz; en las tags de 5 ms "intermedias" el
+ *       controlador no se activa, y en las tags de 10 ms toma la medición
+ *       publicada en esa misma tag. Las muestras intermedias se descartan.
+ *     - La referencia (10 Hz) se publica cada 100 ms; el controlador la guarda
+ *       en un estado (target_v) y la reutiliza en sus 10 activaciones siguientes.
+ *
+ * ============================== PERTURBACIÓN ====================================
+ *   Un reactor auxiliar (DisturbanceInjector) emite un EVENTO explícito
+ *   d_v = -5 m/s en t_start durante "duration" = 100 ms (10 muestras del
+ *   controlador de 10 ms) y luego emite d_v = 0. El sensor lo recibe por el
+ *   puerto dv_in (reaction(dv_in)) y lo suma a la medición. NO altera v real.
+ *
+ * ============================== SALIDA (CSV por stdout) =========================
+ *   EVT,<modulo>,<tag_logico_ns>,<tag_fisico_ns>,<exec_ns>   (todas las activaciones)
+ *   CTRL,<t_ns>,v_ref,v_med,e_v,u_raw,u_T                     (cada 10 ms)
+ *   PLANT,<t_ns>,v                                            (cada 10 ms)
+ *   DATA,<t_ns>,v_ref,v_sim,v_med,e_v,u_T,d_v                 (monitor, cada 100 ms)
+ *   DIST,<t_ns>,d_v    REFCHG,<t_ns>,v_ref_nueva    CFG,<nombre>,<valor>
+ *   Los tiempos son "elapsed" (ns desde el inicio): lógico (tag) y físico.
+ *
+ * ============================== EJECUCIÓN =======================================
+ *   lfc src/AircraftController.lf
+ *   bin/AircraftController > salida_kp0.1.csv        (REDIRIGIR a archivo: evita
+ *                                                    que la terminal distorsione
+ *                                                    la medición de tiempos)
+ *   bin/AircraftController --Kp 0.5 > salida_kp0.5.csv   (barrido de Kp)
+ *   Para tracing nativo de LF: descomentar "tracing: true" en el target.
+ */
+target C {
+    timeout: 30 sec,
+    fast: false,
+    compiler: "gcc"
+    // tracing: true
+};
+
+// ---------------------------------------------------------------------------
+// SpeedReference (100 ms / 10 Hz): publica v_ref [m/s] y cambia de 100 a 110 m/s
+// ---------------------------------------------------------------------------
+reactor SpeedReference(
+    v_init: double = 100.0,   // m/s
+    v_final: double = 110.0,  // m/s
+    t_change: time = 20 sec   // instante lógico del cambio de referencia
+) {
+    timer t(0, 100 ms);
+    output v_ref: double;
+    state current_ref: double = v_init;
+    state changed: int = 0;
+
+    reaction(t) -> v_ref {=
+        interval_t t_phys = lf_time_physical_elapsed();
+
+        if (!self->changed && lf_time_logical_elapsed() >= self->t_change) {
+            self->current_ref = self->v_final;
+            self->changed = 1;
+            printf("REFCHG,%lld,%.3f\n",
+                   (long long) lf_time_logical_elapsed(), self->current_ref);
+        }
+        lf_set(v_ref, self->current_ref);
+
+        interval_t exec = lf_time_physical_elapsed() - t_phys;
+        printf("EVT,SpeedReference,%lld,%lld,%lld\n",
+               (long long) lf_time_logical_elapsed(), (long long) t_phys, (long long) exec);
+    =}
+}
+
+// ---------------------------------------------------------------------------
+// DisturbanceInjector (auxiliar): inyecta d_v como evento explícito
+// ---------------------------------------------------------------------------
+reactor DisturbanceInjector(
+    t_start: time = 12 sec,    // instante lógico de inicio de la perturbación
+    duration: time = 100 ms,   // 10 muestras del controlador (10 ms)
+    magnitude: double = -5.0   // m/s (sesgo del sensor)
+) {
+    timer start_timer(t_start);       // offset = t_start, sin repetición
+    logical action end_pulse;
+    output dv: double;
+
+    reaction(start_timer) -> dv, end_pulse {=
+        lf_set(dv, self->magnitude);
+        lf_schedule(end_pulse, self->duration);
+        printf("DIST,%lld,%.3f\n", (long long) lf_time_logical_elapsed(), self->magnitude);
+    =}
+
+    reaction(end_pulse) -> dv {=
+        lf_set(dv, 0.0);
+        printf("DIST,%lld,%.3f\n", (long long) lf_time_logical_elapsed(), 0.0);
+    =}
+}
+
+// ---------------------------------------------------------------------------
+// AirDataSensor (5 ms / 200 Hz): v_med = v_sim + d_v   [m/s]
+// Orden de reactions en una misma tag (lo fija el orden de declaración):
+//   1) guarda la última v_sim   2) actualiza d_v   3) publica la medición
+// ---------------------------------------------------------------------------
+reactor AirDataSensor {
+    timer t(0, 5 ms);
+    input v_sim: double;      // velocidad real simulada [m/s] (llega cada 10 ms)
+    input dv_in: double;      // perturbation_input: evento explícito [m/s]
+    output v_med: double;     // medición [m/s] (se publica cada 5 ms)
+
+    state v_last: double = 0.0;   // última velocidad real recibida
+    state d_v: double = 0.0;      // perturbación vigente
+
+    // Reaction 1: registra la última velocidad real disponible
+    reaction(v_sim) {=
+        self->v_last = v_sim->value;
+    =}
+
+    // Reaction 2 (perturbation_input): se activa SOLO cuando llega un evento dv
+    reaction(dv_in) {=
+        self->d_v = dv_in->value;
+    =}
+
+    // Reaction 3: periódica; calcula y publica v_med = v + d_v
+    reaction(t) -> v_med {=
+        interval_t t_phys = lf_time_physical_elapsed();
+
+        lf_set(v_med, self->v_last + self->d_v);
+
+        interval_t exec = lf_time_physical_elapsed() - t_phys;
+        printf("EVT,AirDataSensor,%lld,%lld,%lld\n",
+               (long long) lf_time_logical_elapsed(), (long long) t_phys, (long long) exec);
+    =}
+}
+
+// ---------------------------------------------------------------------------
+// SpeedController (10 ms / 100 Hz): u_T = sat(Kp*e_v, 0, 1)
+// Kp [1/(m/s)]: unidades coherentes para que u_T quede en [0,1].
+// ---------------------------------------------------------------------------
+reactor SpeedController(
+    Kp: double = 0.1,
+    v_ref_init: double = 100.0
+) {
+    timer t(0, 10 ms);
+    input v_ref: double;
+    input v_med: double;
+    output u_T: double;       // comando normalizado [0,1]
+    output e_v: double;       // error [m/s] (para el monitor)
+
+    state target_v: double = v_ref_init;
+    state med_last: double = 0.0;
+
+    reaction(startup) {=
+        printf("CFG,Kp,%.4f\n", self->Kp);
+    =}
+
+    // Reaction 1 (por evento): SOLO guarda la nueva referencia. No calcula el
+    // comando, de modo que la frecuencia de control sigue siendo la del timer
+    // (100 Hz) y no la de llegada de la referencia (10 Hz).
+    reaction(v_ref) {=
+        self->target_v = v_ref->value;
+    =}
+
+    // Reaction 2 (periódica): cálculo del control
+    reaction(t) v_med -> u_T, e_v {=
+        interval_t t_phys = lf_time_physical_elapsed();
+
+        if (v_med->is_present) {
+            self->med_last = v_med->value;   // si no hubiera muestra, se reutiliza la última
+        }
+        double e = self->target_v - self->med_last;
+        double u_raw = self->Kp * e;
+        double u = u_raw;
+        if (u > 1.0) u = 1.0;      // saturación superior
+        if (u < 0.0) u = 0.0;      // saturación inferior
+
+        lf_set(u_T, u);
+        lf_set(e_v, e);
+
+        printf("CTRL,%lld,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+               (long long) lf_time_logical_elapsed(),
+               self->target_v, self->med_last, e, u_raw, u);
+
+        interval_t exec = lf_time_physical_elapsed() - t_phys;
+        printf("EVT,SpeedController,%lld,%lld,%lld\n",
+               (long long) lf_time_logical_elapsed(), (long long) t_phys, (long long) exec);
+    =}
+}
+
+// ---------------------------------------------------------------------------
+// AircraftDynamics (10 ms / 100 Hz): v[k+1] = v[k] + Ts*(a_T*u_T[k] - a_D*v[k])
+// Reaction 1 (timer): publica v[k].  Reaction 2 (u_T): calcula v[k+1] con el
+// comando u_T[k] de la MISMA tag. Así la planta usa exactamente el último
+// comando y el lazo no forma un ciclo causal (reaction 1 precede a reaction 2).
+// ---------------------------------------------------------------------------
+reactor AircraftDynamics(
+    period: time = 10 ms,
+    v0: double = 90.0,        // m/s
+    a_T: double = 3.0,        // m/s^2 (eficacia de empuje)
+    a_D: double = 0.02        // 1/s   (resistencia)
+) {
+    timer t(0, period);
+    input u_T: double;
+    output v_sim: double;
+
+    state v: double = v0;
+
+    reaction(startup) {=
+        printf("CFG,a_T,%.4f\nCFG,a_D,%.4f\nCFG,v0,%.2f\n",
+               self->a_T, self->a_D, self->v0);
+    =}
+
+    reaction(t) -> v_sim {=
+        interval_t t_phys = lf_time_physical_elapsed();
+
+        lf_set(v_sim, self->v);
+        printf("PLANT,%lld,%.6f\n", (long long) lf_time_logical_elapsed(), self->v);
+
+        interval_t exec = lf_time_physical_elapsed() - t_phys;
+        printf("EVT,AircraftDynamics,%lld,%lld,%lld\n",
+               (long long) lf_time_logical_elapsed(), (long long) t_phys, (long long) exec);
+    =}
+
+    reaction(u_T) {=
+        double Ts = (double) self->period / 1.0e9;   // período en segundos
+        self->v = self->v + Ts * (self->a_T * u_T->value - self->a_D * self->v);
+    =}
+}
+
+// ---------------------------------------------------------------------------
+// FlightMonitor (100 ms / 10 Hz): registra v_ref, v, v_med, e_v, u_T, d_v
+// ---------------------------------------------------------------------------
+reactor FlightMonitor {
+    timer t(0, 100 ms);
+    input v_ref: double;
+    input v_med: double;
+    input v_sim: double;
+    input u_T: double;
+    input e_v: double;
+    input dv: double;
+
+    state d_v: double = 0.0;
+
+    reaction(startup) {=
+        printf("# Formato: EVT,modulo,tag_logico_ns,tag_fisico_ns,exec_ns | CTRL | PLANT | DATA | DIST | REFCHG | CFG\n");
+    =}
+
+    reaction(dv) {=
+        self->d_v = dv->value;
+    =}
+
+    reaction(t) v_ref, v_med, v_sim, u_T, e_v {=
+        interval_t t_phys = lf_time_physical_elapsed();
+
+        double r   = v_ref->is_present ? v_ref->value : 0.0;
+        double med = v_med->is_present ? v_med->value : 0.0;
+        double sim = v_sim->is_present ? v_sim->value : 0.0;
+        double u   = u_T->is_present   ? u_T->value   : 0.0;
+        double e   = e_v->is_present   ? e_v->value   : 0.0;
+
+        printf("DATA,%lld,%.6f,%.6f,%.6f,%.6f,%.6f,%.3f\n",
+               (long long) lf_time_logical_elapsed(), r, sim, med, e, u, self->d_v);
+
+        interval_t exec = lf_time_physical_elapsed() - t_phys;
+        printf("EVT,FlightMonitor,%lld,%lld,%lld\n",
+               (long long) lf_time_logical_elapsed(), (long long) t_phys, (long long) exec);
+    =}
+}
+
+// ---------------------------------------------------------------------------
+// MAIN: instancia los 5 reactors (+ el inyector auxiliar) y conecta los puertos.
+// Kp puede cambiarse por línea de comandos:  bin/AircraftController --Kp 0.5
+// ---------------------------------------------------------------------------
+main reactor(Kp: double = 0.1) {
+    ref     = new SpeedReference();
+    dist    = new DisturbanceInjector();
+    sensor  = new AirDataSensor();
+    ctrl    = new SpeedController(Kp = Kp);
+    plant   = new AircraftDynamics();
+    monitor = new FlightMonitor();
+
+    // Referencia
+    ref.v_ref -> ctrl.v_ref;
+    ref.v_ref -> monitor.v_ref;
+
+    // Perturbación (evento explícito hacia el sensor, y registro en el monitor)
+    dist.dv -> sensor.dv_in;
+    dist.dv -> monitor.dv;
+
+    // Planta -> sensor
+    plant.v_sim -> sensor.v_sim;
+    plant.v_sim -> monitor.v_sim;
+
+    // Sensor -> controlador
+    sensor.v_med -> ctrl.v_med;
+    sensor.v_med -> monitor.v_med;
+
+    // Controlador -> planta
+    ctrl.u_T -> plant.u_T;
+    ctrl.u_T -> monitor.u_T;
+    ctrl.e_v -> monitor.e_v;
+}

@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/Paulina/Documents/UdeA/T_real/Practica4_RTS/src-gen/AircraftController/build/cmake_install.cmake",
+		"C:/Users/Paulina/Documents/UdeA/T_real/Practica4_RTS/src-gen/AircraftController/build/core/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
